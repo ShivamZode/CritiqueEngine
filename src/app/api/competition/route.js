@@ -3,6 +3,7 @@ import { connectToDatabase } from '@/lib/mongodb';
 import Artwork from '@/models/Artwork';
 import User from '@/models/User';
 import Competition from '@/models/Competition';
+export const dynamic = 'force-dynamic';
 import Critique from '@/models/Critique'; 
 
 export const revalidate = 300;
