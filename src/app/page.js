@@ -55,6 +55,8 @@ export default function Home() {
   // 1. AUTHENTICATION
   // ==========================================
   useEffect(() => {
+    let attempts = 0; // 👉 NEW: Track our retry attempts
+
     async function authenticate() {
       const tg = typeof window !== 'undefined' ? window.Telegram?.WebApp : null;
       
@@ -73,7 +75,11 @@ export default function Home() {
         // 2. Fetch the REAL database profile in the background
         fetch('/api/users/me', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 
+            'Content-Type': 'application/json',
+            // 👉 GOOD HABIT: Attach the ID card here too while we're at it!
+            'x-telegram-init-data': window.Telegram?.WebApp?.initData || ''
+          },
           body: JSON.stringify({
             telegramId: uId,
             username: user.username,
@@ -97,7 +103,14 @@ export default function Home() {
         return;
       }
 
-      // If outside Telegram (Web Browser)
+      // 👉 THE FIX: If Telegram isn't ready yet, wait 50ms and try again! (Max 500ms delay)
+      if (typeof window !== 'undefined' && attempts < 10) {
+        attempts++;
+        setTimeout(authenticate, 50);
+        return;
+      }
+
+      // If outside Telegram (Web Browser) or Telegram failed to load after 10 tries
       try {
         const res = await fetch('/api/auth/me');
         const data = await res.json();
@@ -111,6 +124,7 @@ export default function Home() {
 
       setCurrentUser(null);
     }
+    
     authenticate();
   }, []);
 

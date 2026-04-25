@@ -1,5 +1,6 @@
 // src/app/layout.js
 import './globals.css';
+import Script from 'next/script'; // 👉 THE FIX: Import the Next.js Script component
 
 export const metadata = {
   title: 'Critique Engine',
@@ -8,11 +9,10 @@ export const metadata = {
 
 export default function RootLayout({ children }) {
   return (
-    // Add suppressHydrationWarning here to stop Next.js from panicking 
-    // when Telegram injects its theme colors!
     <html lang="en" suppressHydrationWarning>
       <head>
-        <script src="https://telegram.org/js/telegram-web-app.js" async></script>
+        {/* 👉 THE FIX: Force Telegram to load BEFORE React boots up */}
+        <Script src="https://telegram.org/js/telegram-web-app.js" strategy="beforeInteractive" />
       </head>
       <body className="bg-zinc-900 text-white">
         {children}
