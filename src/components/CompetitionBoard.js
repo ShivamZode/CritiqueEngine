@@ -37,9 +37,11 @@ const CountdownTimer = ({ startTime, endTime }) => {
     return () => clearInterval(timer);
   }, [startTime, endTime]);
 
-  if (status === 'ended') return <span style={{ color: '#ef4444', fontWeight: 'bold', border: '1px solid rgba(239, 68, 68, 0.5)', padding: '6px 12px', borderRadius: '999px', backgroundColor: 'rgba(239, 68, 68, 0.15)', fontSize: '12px', textTransform: 'uppercase', letterSpacing: '1px' }}>Event Closed</span>;
-  if (status === 'starts') return <span style={{ color: '#60a5fa', fontWeight: 'bold', border: '1px solid rgba(59, 130, 246, 0.5)', padding: '6px 12px', borderRadius: '999px', backgroundColor: 'rgba(59, 130, 246, 0.15)', fontSize: '12px', textTransform: 'uppercase', letterSpacing: '1px' }}>⏳ Starts in: {timeLeft}</span>;
-  return <span style={{ color: '#fde047', fontWeight: 'bold', border: '1px solid rgba(253, 224, 71, 0.5)', padding: '6px 12px', borderRadius: '999px', backgroundColor: 'rgba(253, 224, 71, 0.15)', fontSize: '12px', textTransform: 'uppercase', letterSpacing: '1px' }}><Hourglass size={12} /> Ends in: {timeLeft}</span>;
+  if (status === 'ended') return <span style={{ display: 'inline-flex', alignItems: 'center', color: '#ef4444', fontWeight: 'bold', border: '1px solid rgba(239, 68, 68, 0.5)', padding: '6px 12px', borderRadius: '999px', backgroundColor: 'rgba(239, 68, 68, 0.15)', fontSize: '12px', textTransform: 'uppercase', letterSpacing: '1px' }}>Event Closed</span>;
+  if (status === 'starts') return <span style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', color: '#60a5fa', fontWeight: 'bold', border: '1px solid rgba(59, 130, 246, 0.5)', padding: '6px 12px', borderRadius: '999px', backgroundColor: 'rgba(59, 130, 246, 0.15)', fontSize: '12px', textTransform: 'uppercase', letterSpacing: '1px' }}><Hourglass size={14} /> Starts in: {timeLeft}</span>;
+  
+  // 👉 THE FIX: Added inline-flex, alignItems, and gap to make the Hourglass sit perfectly next to the text!
+  return <span style={{ display: 'inline-flex', alignItems: 'center', gap: '6px', color: '#fde047', fontWeight: 'bold', border: '1px solid rgba(253, 224, 71, 0.5)', padding: '6px 12px', borderRadius: '999px', backgroundColor: 'rgba(253, 224, 71, 0.15)', fontSize: '12px', textTransform: 'uppercase', letterSpacing: '1px' }}><Hourglass size={14} /> Ends in: {timeLeft}</span>;
 };
 
 export default function CompetitionBoard({ competitionTag, onBack, onArtClick, onArtistClick, currentUser, onUpload, onRequireLogin }) {
@@ -206,7 +208,8 @@ export default function CompetitionBoard({ competitionTag, onBack, onArtClick, o
               return (
                 <button 
                   onClick={() => onUpload(competitionTag)} 
-                  style={{ padding: '16px 36px', backgroundColor: '#2563eb', color: '#ffffff', borderRadius: '999px', fontWeight: 900, border: 'none', cursor: 'pointer', fontSize: '15px', textTransform: 'uppercase', letterSpacing: '1px', boxShadow: '0 4px 20px rgba(37,99,235,0.4)', transition: 'all 0.2s' }}
+                  // 👉 THE FIX: Added display: 'inline-flex', alignItems: 'center', and gap: '8px'
+                  style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: '8px', padding: '16px 36px', backgroundColor: '#2563eb', color: '#ffffff', borderRadius: '999px', fontWeight: 900, border: 'none', cursor: 'pointer', fontSize: '15px', textTransform: 'uppercase', letterSpacing: '1px', boxShadow: '0 4px 20px rgba(37,99,235,0.4)', transition: 'all 0.2s' }}
                   onMouseOver={(e) => { e.currentTarget.style.backgroundColor = '#1d4ed8'; e.currentTarget.style.transform = 'translateY(-2px)'; }}
                   onMouseOut={(e) => { e.currentTarget.style.backgroundColor = '#2563eb'; e.currentTarget.style.transform = 'translateY(0)'; }}
                 >
