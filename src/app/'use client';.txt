@@ -1,0 +1,920 @@
+'use client';
+
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { Stage, Layer, Rect, Line, Circle, Text, Group, Image as KonvaImage, Transformer, Arrow } from 'react-konva';
+
+const hexToRgba = (hex, opacity) => {
+  if (!hex) return null;
+  let r = 0, g = 0, b = 0;
+  if (hex.length === 7) {
+    r = parseInt(hex.slice(1, 3), 16);
+    g = parseInt(hex.slice(3, 5), 16);
+    b = parseInt(hex.slice(5, 7), 16);
+  }
+  return `rgba(${r}, ${g}, ${b}, ${opacity})`;
+};
+
+const getShapeBounds = (shape) => {
+  let b = { x: 0, y: 0, w: 0, h: 0 };
+  if (shape.type === 'rect') {
+    b = { x: shape.x || 0, y: shape.y || 0, w: (shape.width || 0) * (shape.scaleX || 1), h: (shape.height || 0) * (shape.scaleY || 1) };
+  } else if (shape.points && shape.points.length >= 2) {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (let i = 0; i < shape.points.length; i += 2) {
+      if (shape.points[i] < minX) minX = shape.points[i];
+      if (shape.points[i] > maxX) maxX = shape.points[i];
+      if (shape.points[i+1] < minY) minY = shape.points[i+1];
+      if (shape.points[i+1] > maxY) maxY = shape.points[i+1];
+    }
+    b = { 
+      x: minX * (shape.scaleX || 1) + (shape.x || 0), 
+      y: minY * (shape.scaleY || 1) + (shape.y || 0), 
+      w: (maxX - minX) * (shape.scaleX || 1), 
+      h: (maxY - minY) * (shape.scaleY || 1) 
+    };
+  }
+  return { x: b.w < 0 ? b.x + b.w : b.x, y: b.h < 0 ? b.y + b.h : b.y, w: Math.abs(b.w), h: Math.abs(b.h) };
+};
+
+// ============================================================================
+// POINT-IN-POLYGON HIERARCHY ENGINE
+// ============================================================================
+const isPointInShape = (px, py, shape) => {
+  const scaleX = shape.scaleX || 1;
+  const scaleY = shape.scaleY || 1;
+  const rotation = (shape.rotation || 0) * Math.PI / 180;
+  const dx = px - (shape.x || 0);
+  const dy = py - (shape.y || 0);
+
+  const cos = Math.cos(-rotation);
+  const sin = Math.sin(-rotation);
+  const localX = (dx * cos - dy * sin) / scaleX;
+  const localY = (dx * sin + dy * cos) / scaleY;
+
+  if (shape.type === 'rect') {
+    return localX >= 0 && localX <= (shape.width || 0) &&
+           localY >= 0 && localY <= (shape.height || 0);
+  } 
+  else if (shape.points && shape.points.length >= 6) {
+    let inside = false;
+    const pts = shape.points;
+    for (let i = 0, j = pts.length - 2; i < pts.length; j = i, i += 2) {
+      const xi = pts[i], yi = pts[i+1];
+      const xj = pts[j], yj = pts[j+1];
+      const intersect = ((yi > localY) !== (yj > localY)) && 
+                        (localX < (xj - xi) * (localY - yi) / (yj - yi) + xi);
+      if (intersect) inside = !inside;
+    }
+    return inside;
+  }
+  return false;
+};
+
+const calculateParentId = (newShape, allShapes) => {
+  const nBounds = getShapeBounds(newShape);
+  const nCenterX = nBounds.x + (nBounds.w / 2);
+  const nCenterY = nBounds.y + (nBounds.h / 2);
+
+  // THE FIX: Hardcoded exclusion of 'freehand' shapes. They can NEVER be parents.
+  const potentialParents = allShapes.filter(s => s.id !== newShape.id && s.type !== 'eraser' && s.type !== 'freehand');
+  
+  let bestParentId = null;
+  let minArea = Infinity;
+
+  potentialParents.forEach(parent => {
+    const pBounds = getShapeBounds(parent);
+    const pArea = pBounds.w * pBounds.h;
+    const nArea = nBounds.w * nBounds.h;
+
+    // Parent must physically be larger than the child
+    if (pArea > nArea) {
+      // Ray-cast check: Is the exact center of the child strictly inside the parent's filled geometry?
+      if (isPointInShape(nCenterX, nCenterY, parent)) {
+        if (pArea < minArea) { 
+          minArea = pArea; 
+          bestParentId = parent.id; 
+        }
+      }
+    }
+  });
+  return bestParentId;
+};
+
+const recalculateAllHierarchies = (currentShapes) => {
+  const shapesCopy = currentShapes.map(s => ({ ...s, parentId: null, depth: 0 }));
+  
+  shapesCopy.forEach(shape => {
+    if (shape.type !== 'eraser') {
+       shape.parentId = calculateParentId(shape, shapesCopy);
+    }
+  });
+
+  shapesCopy.forEach(shape => {
+    if (shape.type !== 'eraser') {
+       let d = 0;
+       let curr = shape;
+       let visited = new Set();
+       while (curr && curr.parentId && !visited.has(curr.id)) {
+           visited.add(curr.id);
+           curr = shapesCopy.find(s => s.id === curr.parentId);
+           if (curr) d++;
+       }
+       shape.depth = d;
+    }
+  });
+
+  return shapesCopy;
+};
+
+const MemoizedLabel = React.memo(({ shape, stageScale }) => {
+  if (!shape.title || shape.type === 'eraser') return null;
+  const bounds = getShapeBounds(shape);
+  return (
+    <Group x={bounds.x} y={bounds.y - (14 / stageScale)}>
+      <Rect fill="rgba(0,0,0,0.7)" cornerRadius={4 / stageScale} width={(shape.title.length * 8 + 12) / stageScale} height={14 / stageScale} />
+      <Text text={shape.title} x={6 / stageScale} y={2 / stageScale} fontSize={10 / stageScale} fill="#3b82f6" fontStyle="bold" />
+    </Group>
+  );
+}, (prev, next) => prev.shape.title === next.shape.title && prev.shape.x === next.shape.x && prev.shape.y === next.shape.y && prev.stageScale === next.stageScale && prev.shape.scaleX === next.shape.scaleX && prev.shape.scaleY === next.shape.scaleY);
+
+const MemoizedBadge = React.memo(({ shape, index, isSelected, stageScale }) => {
+  const bounds = getShapeBounds(shape);
+  return (
+    <Group id={`badge-${shape.id}`} x={bounds.x - (24 / stageScale)} y={bounds.y - (24 / stageScale)}>
+      <Circle radius={12 / stageScale} fill={isSelected ? "#eab308" : "#18181b"} stroke="#3b82f6" strokeWidth={2 / stageScale} shadowColor="black" shadowBlur={3} shadowOpacity={0.5} />
+      <Text text={(index + 1).toString()} x={-12 / stageScale} y={-5 / stageScale} width={24 / stageScale} align="center" fontSize={10 / stageScale} fontStyle="bold" fill={isSelected ? "black" : "white"} />
+    </Group>
+  );
+}, (prev, next) => prev.shape === next.shape && prev.isSelected === next.isSelected && prev.stageScale === next.stageScale);
+
+const MemoizedShape = React.memo(({ shape, isSelected, activeTool, onDragEnd, onTransformEnd }) => {
+  const handleDragStart = (e) => { if (e.evt && e.evt.touches && e.evt.touches.length > 1) e.target.stopDrag(); };
+
+  if (shape.type === 'rect') {
+    return (
+      <Rect
+        id={shape.id} x={shape.x} y={shape.y} width={shape.width} height={shape.height}
+        scaleX={shape.scaleX || 1} scaleY={shape.scaleY || 1} rotation={shape.rotation || 0}
+        stroke={hexToRgba(shape.color, shape.strokeOpacity)} strokeWidth={shape.thickness || 4} 
+        fill={shape.fill ? hexToRgba(shape.fill, shape.fillOpacity) : null} 
+        dash={[10, 5]}
+        draggable={activeTool === 'select' && isSelected}
+        onDragStart={handleDragStart} onDragEnd={(e) => onDragEnd(e, shape.id)} onTransformEnd={(e) => onTransformEnd(e, shape.id)}
+        perfectDrawEnabled={false} shadowEnabled={isSelected} shadowColor="white" shadowBlur={10}
+        hitStrokeWidth={Math.max(40, (shape.thickness || 4) + 20)} listening={activeTool === 'select'} 
+      />
+    );
+  }
+  
+  if (shape.type === 'line' || shape.type === 'freehand' || shape.type === 'eraser') {
+    return (
+      <Line
+        id={shape.id} points={shape.points} x={shape.x || 0} y={shape.y || 0} 
+        scaleX={shape.scaleX || 1} scaleY={shape.scaleY || 1} rotation={shape.rotation || 0}
+        stroke={shape.type === 'eraser' ? 'white' : hexToRgba(shape.color, shape.strokeOpacity)} strokeWidth={shape.thickness || 4}
+        fill={(shape.fill && shape.isFinished) ? hexToRgba(shape.fill, shape.fillOpacity) : null} closed={!!shape.closed} 
+        lineCap="round" lineJoin="round" tension={shape.type === 'line' ? 0 : 0.5} globalCompositeOperation={shape.type === 'eraser' ? 'destination-out' : 'source-over'}
+        draggable={activeTool === 'select' && isSelected}
+        onDragStart={handleDragStart} onDragEnd={(e) => onDragEnd(e, shape.id)} onTransformEnd={(e) => onTransformEnd(e, shape.id)}
+        perfectDrawEnabled={false} shadowEnabled={isSelected} shadowColor="white" shadowBlur={10}
+        hitStrokeWidth={Math.max(40, (shape.thickness || 4) + 20)} listening={activeTool === 'select'} 
+      />
+    );
+  }
+
+  if (shape.type === 'arrow') {
+    return (
+      <Arrow
+        id={shape.id} points={shape.points} x={shape.x || 0} y={shape.y || 0} 
+        scaleX={shape.scaleX || 1} scaleY={shape.scaleY || 1} rotation={shape.rotation || 0}
+        stroke={hexToRgba(shape.color, shape.strokeOpacity)} strokeWidth={shape.thickness || 4}
+        fill={hexToRgba(shape.color, shape.strokeOpacity)} 
+        pointerLength={shape.thickness * 3} pointerWidth={shape.thickness * 3} 
+        draggable={activeTool === 'select' && isSelected}
+        onDragStart={handleDragStart} onDragEnd={(e) => onDragEnd(e, shape.id)} onTransformEnd={(e) => onTransformEnd(e, shape.id)}
+        perfectDrawEnabled={false} shadowEnabled={isSelected} shadowColor="white" shadowBlur={10}
+        hitStrokeWidth={Math.max(40, (shape.thickness || 4) + 20)} listening={activeTool === 'select'} 
+      />
+    );
+  }
+  return null;
+}, (prevProps, nextProps) => prevProps.shape === nextProps.shape && prevProps.isSelected === nextProps.isSelected && prevProps.activeTool === nextProps.activeTool);
+
+
+export default function CritiqueCanvas() {
+  const containerRef = useRef(null);
+  const [dimensions, setDimensions] = useState({ width: 0, height: 0 });
+  const [imageObj, setImageObj] = useState(null);
+
+  const [stagePos, setStagePos] = useState({ x: 0, y: 0 });
+  const [stageScale, setStageScale] = useState(1);
+  const isPanning = useRef(false);
+  const lastMousePos = useRef({ x: 0, y: 0 });
+  const lastCenter = useRef(null);
+  const lastDist = useRef(0);
+  const preventClick = useRef(false); 
+
+  const [activeTool, setActiveTool] = useState('pan');
+  const isDrawing = useRef(false);
+  
+  const [brushSize, setBrushSize] = useState(4);
+  const [brushColor, setBrushColor] = useState('#ef4444'); 
+  const [strokeOpacity, setStrokeOpacity] = useState(1); 
+  const [fillColor, setFillColor] = useState('#3b82f6'); 
+  const [fillOpacity, setFillOpacity] = useState(0.5); 
+  const [fillEnabled, setFillEnabled] = useState(false);
+
+  const [shapes, setShapes] = useState([]);
+  const historyRef = useRef([[]]); 
+  const historyStepRef = useRef(0);
+  const [canUndo, setCanUndo] = useState(false);
+  const [canRedo, setCanRedo] = useState(false);
+  
+  const [selectedId, setSelectedId] = useState(null);
+  const [activeCommentId, setActiveCommentId] = useState(null); 
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+
+  const trRef = useRef(null);
+  const drawingLayerRef = useRef(null);
+  const animationRef = useRef(null);
+
+  const addShape = useCallback((newShape) => {
+    setShapes((prev) => [...prev, newShape]);
+  }, []);
+
+  const updateAndCommit = useCallback((updaterFn) => {
+    setShapes((prevShapes) => {
+      const updatedShapes = updaterFn(prevShapes);
+      const finalizedShapes = recalculateAllHierarchies(updatedShapes);
+
+      const currentStep = historyStepRef.current;
+      const newHistory = historyRef.current.slice(0, currentStep + 1);
+      newHistory.push(finalizedShapes);
+      
+      historyRef.current = newHistory;
+      historyStepRef.current = newHistory.length - 1;
+      
+      setCanUndo(true);
+      setCanRedo(false);
+
+      return finalizedShapes;
+    });
+  }, []);
+
+  const deleteSelectedShape = useCallback(() => {
+    if (selectedId) {
+      updateAndCommit(prevShapes => prevShapes.filter(s => s.id !== selectedId));
+      setSelectedId(null);
+      setActiveCommentId(null);
+    }
+  }, [selectedId, updateAndCommit]);
+
+  useEffect(() => {
+    function handleResize() { if (containerRef.current) setDimensions({ width: containerRef.current.offsetWidth, height: containerRef.current.offsetHeight }); }
+    handleResize(); window.addEventListener('resize', handleResize); return () => window.removeEventListener('resize', handleResize);
+  }, []);
+
+  useEffect(() => {
+    const img = new window.Image();
+    img.src = 'https://images.unsplash.com/photo-1579783902614-a3fb3927b6a5?q=80&w=800'; 
+    img.crossOrigin = 'Anonymous';
+    img.onload = () => {
+      setImageObj(img);
+      if (containerRef.current) {
+        const w = containerRef.current.offsetWidth;
+        const h = containerRef.current.offsetHeight;
+        const scale = Math.min(w / img.width, h / img.height) * 0.9;
+        setStageScale(scale);
+        setStagePos({ x: (w - img.width * scale) / 2, y: (h - img.height * scale) / 2 });
+      }
+    };
+  }, []);
+
+  const lerpToShape = useCallback((shapeId) => {
+    setShapes((currentShapes) => {
+      const targetShape = currentShapes.find(s => s.id === shapeId);
+      if (!targetShape) return currentShapes;
+      const bounds = getShapeBounds(targetShape);
+      const centerX = bounds.x + (bounds.w / 2);
+      const centerY = bounds.y + (bounds.h / 2);
+
+      setStagePos((prevPos) => {
+        if (animationRef.current) cancelAnimationFrame(animationRef.current);
+        const startX = prevPos.x; const startY = prevPos.y;
+        const targetX = (dimensions.width / 2) - (centerX * stageScale);
+        const targetY = (dimensions.height / 2) - (centerY * stageScale);
+        
+        const startTime = performance.now();
+        const duration = 400; 
+        const animate = (currentTime) => {
+          const elapsed = currentTime - startTime;
+          const progress = Math.min(elapsed / duration, 1);
+          const ease = 1 - Math.pow(1 - progress, 3);
+          setStagePos({ x: startX + (targetX - startX) * ease, y: startY + (targetY - startY) * ease });
+          if (progress < 1) animationRef.current = requestAnimationFrame(animate);
+        };
+        animationRef.current = requestAnimationFrame(animate);
+        return prevPos; 
+      });
+      return currentShapes;
+    });
+  }, [dimensions, stageScale]);
+
+  useEffect(() => {
+    if (activeTool === 'select' && selectedId) {
+      const shape = shapes.find((s) => s.id === selectedId);
+      if (shape) {
+        if (shape.color) setBrushColor(shape.color);
+        if (shape.strokeOpacity !== undefined) setStrokeOpacity(shape.strokeOpacity);
+        if (shape.thickness) setBrushSize(shape.thickness);
+        if (shape.fill) { setFillEnabled(true); setFillColor(shape.fill); } 
+        else { setFillEnabled(false); }
+        if (shape.fillOpacity !== undefined) setFillOpacity(shape.fillOpacity);
+      }
+    }
+  }, [selectedId, activeTool]);
+
+  useEffect(() => {
+    if (selectedId && isSidebarOpen) {
+      const el = document.getElementById(`list-item-${selectedId}`);
+      if (el) el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+  }, [selectedId, isSidebarOpen]);
+
+  const updateSelectedShapeText = (key, value) => {
+    const targetId = activeCommentId || selectedId;
+    if (targetId) setShapes((prevShapes) => prevShapes.map((shape) => shape.id === targetId ? { ...shape, [key]: value } : shape));
+  };
+  
+  const closeCommentBoxAndCommit = () => { 
+    setActiveCommentId(null); 
+    updateAndCommit(p => p); 
+  };
+
+  const handleUndo = useCallback(() => {
+    if (historyStepRef.current <= 0) return;
+    historyStepRef.current -= 1;
+    setShapes(historyRef.current[historyStepRef.current]);
+    setCanUndo(historyStepRef.current > 0);
+    setCanRedo(true);
+    setSelectedId(null); setActiveCommentId(null);
+  }, []);
+
+  const handleRedo = useCallback(() => {
+    if (historyStepRef.current >= historyRef.current.length - 1) return;
+    historyStepRef.current += 1;
+    setShapes(historyRef.current[historyStepRef.current]);
+    setCanUndo(true);
+    setCanRedo(historyStepRef.current < historyRef.current.length - 1);
+    setSelectedId(null); setActiveCommentId(null);
+  }, []);
+
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      const isTyping = document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA';
+      if ((e.key === 'Delete' || e.key === 'Backspace') && !isTyping) { e.preventDefault(); deleteSelectedShape(); }
+      if (e.ctrlKey || e.metaKey) {
+        if (e.key === 'z' || e.key === 'Z') { e.preventDefault(); handleUndo(); } 
+        else if (e.key === 'y' || e.key === 'Y') { e.preventDefault(); handleRedo(); }
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown); return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [handleUndo, handleRedo, deleteSelectedShape]); 
+
+  useEffect(() => {
+    if (activeTool === 'select' && selectedId && drawingLayerRef.current) {
+      const node = drawingLayerRef.current.findOne('#' + selectedId);
+      if (node && trRef.current && node.className !== 'Line') {
+        trRef.current.nodes([node]); trRef.current.getLayer().batchDraw();
+      } else if (trRef.current) { trRef.current.nodes([]); }
+    } else if (trRef.current) { trRef.current.nodes([]); }
+  }, [selectedId, activeTool, shapes]);
+
+  const getRelativePointerPosition = (stage) => {
+    const transform = stage.getAbsoluteTransform().copy();
+    transform.invert(); return transform.point(stage.getPointerPosition());
+  };
+
+  const handleWheel = (e) => {
+    e.evt.preventDefault();
+    if (animationRef.current) cancelAnimationFrame(animationRef.current); 
+    const stage = e.target.getStage();
+    if (e.evt.ctrlKey || e.evt.buttons === 4) {
+      const scaleBy = 1.1; const oldScale = stage.scaleX(); const pointer = stage.getPointerPosition();
+      const mousePointTo = { x: (pointer.x - stage.x()) / oldScale, y: (pointer.y - stage.y()) / oldScale };
+      const newScale = e.evt.deltaY < 0 ? oldScale * scaleBy : oldScale / scaleBy;
+      setStageScale(newScale); setStagePos({ x: pointer.x - mousePointTo.x * newScale, y: pointer.y - mousePointTo.y * newScale });
+    } else {
+      setStagePos((prev) => ({ x: prev.x - e.evt.deltaX, y: prev.y - e.evt.deltaY }));
+    }
+  };
+
+  const handlePointerDown = (e) => {
+    if (animationRef.current) cancelAnimationFrame(animationRef.current); 
+    const stage = e.target.getStage();
+    
+    if (e.evt.touches && e.evt.touches.length > 1) { preventClick.current = true; return; }
+    preventClick.current = false;
+
+    if (e.evt.button === 1 || activeTool === 'pan') { 
+      e.evt.preventDefault(); isPanning.current = true; preventClick.current = true; 
+      const clientX = e.evt.touches ? e.evt.touches[0].clientX : e.evt.clientX;
+      const clientY = e.evt.touches ? e.evt.touches[0].clientY : e.evt.clientY;
+      lastMousePos.current = { x: clientX, y: clientY };
+      if (containerRef.current) containerRef.current.style.cursor = 'grabbing';
+      return;
+    }
+    
+    if (activeTool === 'select') {
+      const isTransformer = e.target.getParent() && e.target.getParent().className === 'Transformer';
+      const isVertex = e.target.className === 'Circle' && !e.target.id()?.startsWith('badge-');
+      if (isTransformer || isVertex) return; 
+      let target = e.target; while (target && !target.id()) target = target.getParent();
+      let clickedId = target ? target.id() : null;
+      
+      if (!clickedId || e.target === stage || e.target.attrs.image) { 
+        setSelectedId(null); 
+        if (activeCommentId) closeCommentBoxAndCommit(); 
+        return; 
+      }
+
+      if (clickedId.startsWith('badge-')) {
+        const shapeId = clickedId.replace('badge-', '');
+        setSelectedId(shapeId); setActiveCommentId(shapeId); 
+      } else {
+        setSelectedId(clickedId); setActiveCommentId(null); 
+      }
+      return;
+    }
+
+    const pos = getRelativePointerPosition(stage);
+
+    if (activeTool === 'rect') {
+      isDrawing.current = true;
+      addShape({
+        id: Date.now().toString(), type: 'rect', title: '', comment: '', parentId: null, color: brushColor, strokeOpacity: strokeOpacity,
+        fill: fillEnabled ? fillColor : null, fillOpacity: fillOpacity, x: pos.x, y: pos.y, width: 0, height: 0, thickness: brushSize
+      });
+    }
+
+    if (activeTool === 'freehand' || activeTool === 'eraser') {
+      isDrawing.current = true;
+      addShape({
+        id: Date.now().toString(), type: activeTool === 'eraser' ? 'eraser' : 'freehand', title: '', comment: '', parentId: null,
+        color: activeTool === 'eraser' ? null : brushColor, strokeOpacity: activeTool === 'eraser' ? 1 : strokeOpacity,
+        points: [pos.x, pos.y], thickness: activeTool === 'eraser' ? brushSize * 4 : brushSize
+      });
+    }
+
+    // =========================================================================
+    // RESTORED GOLDEN CODE: LINE & ARROW LOGIC INSIDE POINTER_DOWN
+    // =========================================================================
+    if (activeTool === 'line' || activeTool === 'arrow') {
+      if (isDrawing.current) {
+        const currentLine = shapes[shapes.length - 1];
+        if (!currentLine || (currentLine.type !== 'line' && currentLine.type !== 'arrow')) { isDrawing.current = false; return; }
+
+        const startX = currentLine.points[0]; const startY = currentLine.points[1];
+        const distanceToStart = Math.sqrt(Math.pow(pos.x - startX, 2) + Math.pow(pos.y - startY, 2));
+
+        if (currentLine.type === 'arrow') {
+          updateAndCommit((prevShapes) => {
+            const newShapes = [...prevShapes];
+            const line = { ...newShapes[newShapes.length - 1] };
+            line.points = [line.points[0], line.points[1], pos.x, pos.y];
+            line.isFinished = true; 
+            newShapes[newShapes.length - 1] = line;
+            
+            // SYNCHRONOUS SELECT AND COMMENT POPUP
+            setSelectedId(line.id);
+            setActiveCommentId(line.id);
+            setActiveTool('select');
+            
+            return newShapes;
+          });
+          isDrawing.current = false;
+          return;
+        }
+
+        if (currentLine.points.length >= 6 && distanceToStart < 40 / stageScale) {
+          isDrawing.current = false;
+          
+          updateAndCommit((prevShapes) => {
+            const newShapes = [...prevShapes];
+            const line = { ...newShapes[newShapes.length - 1] };
+            line.points = [...line.points.slice(0, -2), startX, startY];
+            line.isFinished = true; line.closed = true; 
+            newShapes[newShapes.length - 1] = line;
+
+            // SYNCHRONOUS SELECT AND COMMENT POPUP
+            setSelectedId(line.id);
+            setActiveCommentId(line.id);
+            setActiveTool('select');
+
+            return newShapes;
+          });
+          
+        } else {
+          setShapes((prevShapes) => {
+            const newShapes = [...prevShapes];
+            const line = { ...newShapes[newShapes.length - 1] };
+            line.points = [...line.points.slice(0, -2), pos.x, pos.y, pos.x, pos.y];
+            newShapes[newShapes.length - 1] = line;
+            return newShapes;
+          });
+        }
+      } else {
+        isDrawing.current = true;
+        addShape({
+          id: Date.now().toString(), type: activeTool, title: '', comment: '', parentId: null, color: brushColor, strokeOpacity: strokeOpacity, fill: fillEnabled ? fillColor : null, fillOpacity: fillOpacity,
+          points: [pos.x, pos.y, pos.x, pos.y], thickness: brushSize, isFinished: false, closed: false
+        });
+      }
+    }
+  };
+
+  const handlePointerMove = (e) => {
+    if (isPanning.current) {
+      e.evt.preventDefault(); preventClick.current = true;
+      const clientX = e.evt.touches ? e.evt.touches[0].clientX : e.evt.clientX;
+      const clientY = e.evt.touches ? e.evt.touches[0].clientY : e.evt.clientY;
+      const dx = clientX - lastMousePos.current.x; const dy = clientY - lastMousePos.current.y;
+      setStagePos((prev) => ({ x: prev.x + dx, y: prev.y + dy })); lastMousePos.current = { x: clientX, y: clientY };
+      return;
+    }
+
+    const touch1 = e.evt.touches ? e.evt.touches[0] : null; const touch2 = e.evt.touches ? e.evt.touches[1] : null;
+    if (touch1 && touch2) {
+      e.evt.preventDefault(); preventClick.current = true;
+      const stage = e.target.getStage();
+      const p1 = { x: touch1.clientX, y: touch1.clientY }; const p2 = { x: touch2.clientX, y: touch2.clientY };
+      const getDistance = (p1, p2) => Math.sqrt(Math.pow(p2.x - p1.x, 2) + Math.pow(p2.y - p1.y, 2));
+      const getCenter = (p1, p2) => ({ x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 });
+      const newCenter = getCenter(p1, p2); const dist = getDistance(p1, p2);
+      if (!lastCenter.current) { lastCenter.current = newCenter; lastDist.current = dist; return; }
+      const dx = newCenter.x - lastCenter.current.x; const dy = newCenter.y - lastCenter.current.y;
+      const scaleBy = dist / lastDist.current; const oldScale = stage.scaleX(); const newScale = oldScale * scaleBy;
+      const pointTo = { x: (newCenter.x - stage.x()) / oldScale, y: (newCenter.y - stage.y()) / oldScale };
+      setStageScale(newScale); setStagePos({ x: newCenter.x - pointTo.x * newScale + dx, y: newCenter.y - pointTo.y * newScale + dy });
+      lastCenter.current = newCenter; lastDist.current = dist; return;
+    }
+
+    if (!isDrawing.current) return;
+
+    const stage = e.target.getStage(); const pos = getRelativePointerPosition(stage);
+
+    setShapes((prevShapes) => {
+      if (prevShapes.length === 0) return prevShapes;
+      const newShapes = [...prevShapes]; const currentShape = { ...newShapes[newShapes.length - 1] };
+      
+      if (currentShape.type === 'rect') { 
+        currentShape.width = pos.x - currentShape.x; currentShape.height = pos.y - currentShape.y; 
+      }
+      
+      if (currentShape.type === 'freehand' || currentShape.type === 'eraser') {
+        const len = currentShape.points.length;
+        if (Math.sqrt(Math.pow(pos.x - currentShape.points[len - 2], 2) + Math.pow(pos.y - currentShape.points[len - 1], 2)) > 5) {
+          currentShape.points = [...currentShape.points, pos.x, pos.y];
+        }
+      }
+      
+      if (currentShape.type === 'line' || currentShape.type === 'arrow') {
+        const newPoints = [...currentShape.points]; const len = newPoints.length;
+        newPoints[len - 2] = pos.x; newPoints[len - 1] = pos.y; currentShape.points = newPoints;
+      }
+      
+      newShapes[newShapes.length - 1] = currentShape; return newShapes;
+    });
+  };
+
+  const handlePointerUp = (e) => {
+    if (isPanning.current) {
+      isPanning.current = false;
+      if (containerRef.current) containerRef.current.style.cursor = activeTool === 'pan' ? 'grab' : activeTool === 'select' ? 'default' : 'crosshair';
+    }
+    lastCenter.current = null; lastDist.current = 0;
+
+    if (preventClick.current) {
+      if (!e.evt.touches || e.evt.touches.length === 0) { setTimeout(() => { preventClick.current = false; }, 300); }
+      return; 
+    }
+
+    // =========================================================================
+    // RECT AND FREEHAND SYNCHRONOUS POPUPS
+    // =========================================================================
+    if (isDrawing.current && (activeTool === 'rect' || activeTool === 'freehand' || activeTool === 'eraser')) {
+      isDrawing.current = false;
+      if (activeTool !== 'eraser') {
+        updateAndCommit((prevShapes) => {
+          const newShapes = [...prevShapes];
+          const finishedId = newShapes[newShapes.length - 1].id;
+          
+          setSelectedId(finishedId);
+          setActiveCommentId(finishedId);
+          setActiveTool('select');
+          
+          return newShapes;
+        });
+      } else {
+        updateAndCommit(p => p); 
+      }
+    }
+  };
+
+  const handleDblClick = () => {
+    if (activeTool === 'line' && isDrawing.current) {
+      isDrawing.current = false;
+
+      // =========================================================================
+      // CRITICAL FIX: "DOUBLE CLICK OPENS THE COMMENT" LOGIC
+      // =========================================================================
+      updateAndCommit((prevShapes) => {
+        const newShapes = [...prevShapes];
+        const currentLine = { ...newShapes[newShapes.length - 1] };
+        if (currentLine.type !== 'line') return prevShapes;
+        
+        currentLine.points = currentLine.points.slice(0, -2);
+        currentLine.isFinished = true; 
+        currentLine.closed = true; 
+        
+        newShapes[newShapes.length - 1] = currentLine;
+
+        setSelectedId(currentLine.id);
+        setActiveCommentId(currentLine.id);
+        setActiveTool('select');
+
+        return newShapes;
+      });
+      // =========================================================================
+    }
+  };
+
+  const handleShapeDragEnd = (e, id) => {
+    const node = e.target; if (node.className === 'Circle' || node.className === 'Text') return;
+    updateAndCommit((prevShapes) => prevShapes.map((shape) => {
+      if (shape.id === id) {
+        if (shape.type === 'line' || shape.type === 'arrow' || shape.type === 'freehand') {
+          const dx = node.x() - (shape.x || 0); const dy = node.y() - (shape.y || 0);
+          const newPoints = shape.points.map((p, i) => i % 2 === 0 ? p + dx : p + dy);
+          node.x(0); node.y(0); return { ...shape, points: newPoints, x: 0, y: 0 };
+        }
+        return { ...shape, x: node.x(), y: node.y() };
+      }
+      return shape;
+    }));
+  };
+
+  const handleTransformEnd = (e, id) => {
+    const node = e.target;
+    updateAndCommit((prevShapes) => prevShapes.map((shape) => {
+      if (shape.id === id) return { ...shape, x: node.x(), y: node.y(), scaleX: node.scaleX(), scaleY: node.scaleY(), rotation: node.rotation() };
+      return shape;
+    }));
+  };
+
+  const handleVertexDrag = (e, shapeId, pointIndex) => {
+    const node = e.target;
+    setShapes((prevShapes) => prevShapes.map((shape) => {
+      if (shape.id === shapeId) {
+        const newPoints = [...shape.points]; newPoints[pointIndex] = node.x(); newPoints[pointIndex + 1] = node.y(); 
+        return { ...shape, points: newPoints };
+      }
+      return shape;
+    }));
+  };
+
+  const activeCommentShape = shapes.find(s => s.id === activeCommentId);
+
+  const renderedShapes = [...shapes].sort((a, b) => {
+    if (a.type !== 'eraser' && b.type !== 'eraser') {
+       const depthA = a.depth || 0;
+       const depthB = b.depth || 0;
+       if (depthA !== depthB) return depthA - depthB; 
+       const areaA = getShapeBounds(a).w * getShapeBounds(a).h;
+       const areaB = getShapeBounds(b).w * getShapeBounds(b).h;
+       return areaB - areaA; 
+    }
+    return parseInt(a.id) - parseInt(b.id);
+  });
+
+  const validTreeShapes = shapes.filter(s => s.type !== 'eraser');
+  const ShapeTree = ({ parentId = null, depth = 0 }) => {
+    const children = validTreeShapes.filter(s => s.parentId === parentId);
+    if (children.length === 0) return null;
+    return (
+      <>
+        {children.map((shape) => (
+          <React.Fragment key={shape.id}>
+            <button
+              id={`list-item-${shape.id}`}
+              onClick={() => { lerpToShape(shape.id); setSelectedId(shape.id); setActiveCommentId(shape.id); setActiveTool('select'); }}
+              className={`p-3 border-b border-zinc-800 text-left hover:bg-zinc-800 transition w-full ${selectedId === shape.id ? 'bg-blue-900/20 border-l-4 border-l-blue-500' : 'border-l-4 border-l-transparent'} ${depth > 0 ? 'bg-black/20' : ''}`}
+              style={{ paddingLeft: `${16 + depth * 16}px` }} 
+            >
+              <div className="flex flex-col overflow-hidden w-full">
+                <div className="flex items-center gap-2">
+                  {depth > 0 && <span className="text-zinc-600 font-bold shrink-0">↳</span>}
+                  
+                  <span className={`text-[10px] font-bold w-5 h-5 flex shrink-0 items-center justify-center rounded-full ${selectedId === shape.id ? 'bg-blue-500 text-white' : 'bg-zinc-700 text-zinc-300'}`}>
+                    {validTreeShapes.findIndex(s => s.id === shape.id) + 1}
+                  </span>
+
+                  <span className={`text-sm font-bold truncate ${selectedId === shape.id ? 'text-blue-400' : 'text-zinc-300'}`}>
+                    {shape.title || 'Unnamed Object'}
+                  </span>
+                </div>
+                {shape.comment && (
+                  <span className={`text-xs truncate mt-1 ${depth > 0 ? 'ml-11' : 'ml-7'} text-zinc-500`}>
+                    {shape.comment}
+                  </span>
+                )}
+              </div>
+            </button>
+            <ShapeTree parentId={shape.id} depth={depth + 1} />
+          </React.Fragment>
+        ))}
+      </>
+    );
+  };
+
+  return (
+    <div className="fixed inset-0 w-full h-full bg-zinc-900 overflow-hidden text-white touch-none flex flex-col">
+      
+      <div className="absolute top-4 left-4 right-4 z-10 flex justify-between items-center pointer-events-none">
+        <div className="flex items-center gap-3 pointer-events-auto">
+          <button onClick={() => setIsSidebarOpen(!isSidebarOpen)} className="p-2 bg-zinc-800 hover:bg-zinc-700 border border-zinc-600 rounded-lg shadow-lg text-white">
+            {isSidebarOpen ? '◀' : '▶'} List
+          </button>
+          <h1 className="text-xl md:text-2xl font-bold drop-shadow-md hidden sm:block">Unified Engine</h1>
+        </div>
+        <div className="flex gap-2 pointer-events-auto">
+          <button onClick={handleUndo} disabled={!canUndo} className="px-3 py-1 bg-zinc-700 hover:bg-zinc-600 disabled:opacity-50 rounded shadow font-bold text-sm transition">↩️</button>
+          <button onClick={handleRedo} disabled={!canRedo} className="px-3 py-1 bg-zinc-700 hover:bg-zinc-600 disabled:opacity-50 rounded shadow font-bold text-sm transition">↪️</button>
+        </div>
+      </div>
+
+      <div className={`absolute top-20 bottom-24 left-4 w-3/4 max-w-sm sm:w-64 bg-zinc-900/90 backdrop-blur-md border border-zinc-700 rounded-xl overflow-y-auto flex flex-col pointer-events-auto z-20 transition-transform duration-300 shadow-2xl ${isSidebarOpen ? 'translate-x-0' : '-translate-x-[120%]'}`}>
+        <h2 className="p-4 text-xs font-bold uppercase tracking-widest border-b border-zinc-800 sticky top-0 bg-zinc-900/95 text-blue-400">
+          Object Hierarchy
+        </h2>
+        {validTreeShapes.length === 0 && <p className="p-4 text-xs text-zinc-500 italic">No objects drawn yet.</p>}
+        <ShapeTree parentId={null} depth={0} />
+      </div>
+
+      <div className="absolute top-16 left-1/2 -translate-x-1/2 z-10 flex flex-wrap justify-center items-center gap-2 sm:gap-4 bg-black/80 backdrop-blur-md p-2 rounded-lg shadow-xl border border-zinc-700 w-auto max-w-[95vw] pointer-events-auto">
+        <div className="flex items-center gap-1 sm:gap-2">
+          <span className="text-xs text-zinc-400 font-bold hidden sm:inline">Stroke:</span>
+          <input type="color" value={brushColor} onChange={(e) => { setBrushColor(e.target.value); updateSelectedShapeText('color', e.target.value); }} className="w-6 h-6 rounded cursor-pointer bg-transparent border-none p-0" title="Stroke Color" />
+          <input type="range" min="0.1" max="1" step="0.1" value={strokeOpacity} onChange={(e) => { setStrokeOpacity(parseFloat(e.target.value)); updateSelectedShapeText('strokeOpacity', parseFloat(e.target.value)); }} className="w-12 sm:w-16 accent-blue-500 cursor-pointer" title="Stroke Opacity" />
+        </div>
+        <div className="w-px h-6 bg-zinc-700"></div>
+        <div className="flex items-center gap-1 sm:gap-2">
+          <label className="flex items-center gap-1 cursor-pointer select-none">
+            <input type="checkbox" checked={fillEnabled} onChange={(e) => { setFillEnabled(e.target.checked); updateSelectedShapeText('fill', e.target.checked ? fillColor : null); }} className="w-4 h-4 accent-blue-500 cursor-pointer" />
+            <span className="text-xs font-bold text-zinc-300">Fill:</span>
+          </label>
+          <input type="color" value={fillColor} onChange={(e) => { setFillColor(e.target.value); updateSelectedShapeText('fill', e.target.value); }} disabled={!fillEnabled} className={`w-6 h-6 rounded cursor-pointer bg-transparent border-none p-0 transition-opacity ${!fillEnabled ? 'opacity-30 cursor-not-allowed' : 'opacity-100'}`} title="Fill Color" />
+          <input type="range" min="0.1" max="1" step="0.1" value={fillOpacity} onChange={(e) => { setFillOpacity(parseFloat(e.target.value)); updateSelectedShapeText('fillOpacity', parseFloat(e.target.value)); }} disabled={!fillEnabled} className={`w-12 sm:w-16 accent-blue-500 cursor-pointer ${!fillEnabled && 'opacity-30'}`} title="Fill Opacity" />
+        </div>
+        <div className="w-px h-6 bg-zinc-700"></div>
+        <div className="flex items-center gap-1 sm:gap-2">
+          <span className="text-xs text-zinc-400 font-bold hidden md:inline">Size:</span>
+          <input type="range" min="1" max="30" value={brushSize} onChange={(e) => { setBrushSize(parseInt(e.target.value)); updateSelectedShapeText('thickness', parseInt(e.target.value)); }} className="w-16 accent-blue-500 cursor-pointer" />
+        </div>
+      </div>
+
+      <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-10 flex gap-1 sm:gap-2 bg-black/80 p-2 rounded-xl backdrop-blur-md shadow-2xl overflow-x-auto max-w-[95vw] pointer-events-auto">
+        <button onClick={() => { setActiveTool('pan'); setSelectedId(null); closeCommentBoxAndCommit(); }} className={`px-3 py-2 rounded text-sm font-bold transition-colors ${activeTool === 'pan' ? 'bg-zinc-600 text-white' : 'hover:bg-zinc-800 text-zinc-400'}`}>🖐 Pan</button>
+        <button onClick={() => setActiveTool('select')} className={`px-3 py-2 rounded text-sm font-bold transition-colors ${activeTool === 'select' ? 'bg-zinc-600 text-white' : 'hover:bg-zinc-800 text-zinc-400'}`}>👆 Select</button>
+        <div className="w-px bg-zinc-700 mx-1"></div>
+        <button onClick={() => { setActiveTool('rect'); setSelectedId(null); closeCommentBoxAndCommit(); }} className={`px-3 py-2 rounded text-sm font-bold transition-colors ${activeTool === 'rect' ? 'bg-blue-600 text-white' : 'hover:bg-zinc-800 text-zinc-400'}`}>🔲 Frame</button>
+        <button onClick={() => { setActiveTool('line'); setSelectedId(null); closeCommentBoxAndCommit(); }} className={`px-3 py-2 rounded text-sm font-bold transition-colors ${activeTool === 'line' ? 'bg-blue-600 text-white' : 'hover:bg-zinc-800 text-zinc-400'}`}>📏 Poly</button>
+        <button onClick={() => { setActiveTool('arrow'); setSelectedId(null); closeCommentBoxAndCommit(); }} className={`px-3 py-2 rounded text-sm font-bold transition-colors ${activeTool === 'arrow' ? 'bg-blue-600 text-white' : 'hover:bg-zinc-800 text-zinc-400'}`}>↗️ Arrow</button>
+        <button onClick={() => { setActiveTool('freehand'); setSelectedId(null); closeCommentBoxAndCommit(); }} className={`px-3 py-2 rounded text-sm font-bold transition-colors ${activeTool === 'freehand' ? 'bg-blue-600 text-white' : 'hover:bg-zinc-800 text-zinc-400'}`}>✍️ Draw</button>
+        <div className="w-px bg-zinc-700 mx-1"></div>
+        <button onClick={() => { setActiveTool('eraser'); setSelectedId(null); closeCommentBoxAndCommit(); }} className={`px-3 py-2 rounded text-sm font-bold transition-colors ${activeTool === 'eraser' ? 'bg-pink-500 text-white' : 'hover:bg-zinc-800 text-zinc-400'}`}>🧽 Erase</button>
+      </div>
+
+      {activeTool === 'select' && selectedId && (() => {
+        const shape = shapes.find(s => s.id === selectedId);
+        if (!shape || shape.type === 'eraser') return null;
+        const bounds = getShapeBounds(shape);
+        return (
+          <button
+            onClick={deleteSelectedShape}
+            className="absolute z-20 w-10 h-10 bg-red-600 hover:bg-red-500 border-2 border-zinc-900 text-white rounded-full shadow-2xl flex items-center justify-center font-bold transition-transform hover:scale-110 pointer-events-auto"
+            style={{
+              left: (bounds.x + bounds.w) * stageScale + stagePos.x + 10,
+              top: bounds.y * stageScale + stagePos.y - 20,
+            }}
+            title="Delete Object"
+          >
+            🗑️
+          </button>
+        );
+      })()}
+
+      {activeTool === 'select' && activeCommentShape && (
+        <div 
+          className="absolute z-20 pointer-events-auto shadow-2xl transition-all duration-75"
+          style={{
+            left: (getShapeBounds(activeCommentShape).x * stageScale) + stagePos.x,
+            top: (getShapeBounds(activeCommentShape).y * stageScale) + stagePos.y - 15,
+            transform: 'translateY(-100%)'
+          }}
+        >
+          <div className="bg-zinc-800 border border-zinc-600 rounded-lg p-3 w-64 flex flex-col gap-2 relative">
+            <button onClick={closeCommentBoxAndCommit} className="absolute top-2 right-2 text-zinc-400 hover:text-white font-bold z-30" title="Close">✕</button>
+            <div className="flex flex-col gap-2 pt-1">
+              <span className="text-xs font-bold text-blue-400 uppercase tracking-wider pr-10">
+                Object Details {activeCommentShape.parentId ? '(Child)' : ''}
+              </span>
+              <input 
+                type="text" 
+                maxLength={40}
+                className="w-full bg-zinc-900 border border-zinc-700 rounded p-2 text-sm text-white focus:outline-none focus:border-blue-500 font-bold" 
+                placeholder="Title (e.g. 'Lady')" 
+                value={activeCommentShape.title || ''} 
+                onChange={(e) => updateSelectedShapeText('title', e.target.value)} 
+                onKeyDown={(e) => e.stopPropagation()} 
+              />
+              <textarea 
+                className="w-full bg-zinc-900 border border-zinc-700 rounded p-2 text-sm text-white resize-none focus:outline-none focus:border-blue-500" 
+                rows={3} 
+                placeholder="Add a description or comment (optional)..." 
+                value={activeCommentShape.comment || ''} 
+                onChange={(e) => updateSelectedShapeText('comment', e.target.value)} 
+                onKeyDown={(e) => e.stopPropagation()} 
+              />
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div ref={containerRef} className="w-full h-full bg-zinc-800" style={{ cursor: activeTool === 'pan' ? 'grab' : activeTool === 'select' ? 'default' : 'crosshair' }}>
+        {dimensions.width > 0 && (
+          <Stage 
+            width={dimensions.width} height={dimensions.height}
+            x={stagePos.x} y={stagePos.y} scaleX={stageScale} scaleY={stageScale}
+            onWheel={handleWheel}
+            
+            onMouseDown={handlePointerDown} onMouseMove={handlePointerMove} onMouseUp={handlePointerUp} onMouseLeave={handlePointerUp}
+            onTouchStart={handlePointerDown} onTouchMove={handlePointerMove} onTouchEnd={handlePointerUp}
+            
+            onDblClick={handleDblClick} onDblTap={handleDblClick}
+          >
+            <Layer>
+              {imageObj && <KonvaImage image={imageObj} x={0} y={0} />}
+            </Layer>
+            <Layer ref={drawingLayerRef}>
+              
+              {renderedShapes.map((shape) => (
+                <MemoizedShape key={shape.id} shape={shape} isSelected={shape.id === selectedId} activeTool={activeTool} onDragEnd={handleShapeDragEnd} onTransformEnd={handleTransformEnd} />
+              ))}
+
+              {renderedShapes.map((shape) => ( <MemoizedLabel key={`label-${shape.id}`} shape={shape} stageScale={stageScale} /> ))}
+              
+              {activeTool === 'select' && (selectedId || activeCommentId) && (() => {
+                const targetId = activeCommentId || selectedId;
+                const shape = shapes.find(s => s.id === targetId);
+                if (!shape || shape.type === 'eraser') return null;
+                const index = validTreeShapes.findIndex(s => s.id === targetId);
+
+                return (
+                  <MemoizedBadge
+                    key={`badge-${shape.id}`}
+                    shape={shape}
+                    index={index}
+                    isSelected={shape.id === activeCommentId}
+                    stageScale={stageScale}
+                  />
+                );
+              })()}
+
+              {activeTool === 'select' && selectedId && shapes.find(s => s.id === selectedId && (s.type === 'line' || s.type === 'arrow')) && (
+                shapes.find(s => s.id === selectedId).points.reduce((vertices, coord, idx, arr) => {
+                  if (idx % 2 === 0) {
+                    vertices.push(
+                      <Circle
+                        key={`vertex-${selectedId}-${idx}`} x={coord} y={arr[idx + 1]} radius={6 / stageScale} 
+                        fill="#ffffff" stroke="#3b82f6" strokeWidth={2 / stageScale} draggable
+                        onDragStart={(e) => { if (e.evt && e.evt.touches && e.evt.touches.length > 1) e.target.stopDrag(); }}
+                        onDragMove={(e) => handleVertexDrag(e, selectedId, idx)} 
+                        onDragEnd={(e) => { e.cancelBubble = true; updateAndCommit(p => p); }}
+                        perfectDrawEnabled={false}
+                      />
+                    );
+                  }
+                  return vertices;
+                }, [])
+              )}
+              {activeTool === 'select' && selectedId && (
+                <Transformer ref={trRef} flipEnabled={false} boundBoxFunc={(oldBox, newBox) => { if (Math.abs(newBox.width) < 5 || Math.abs(newBox.height) < 5) return oldBox; return newBox; }} />
+              )}
+            </Layer>
+          </Stage>
+        )}
+      </div>
+    </div>
+  );
+}

@@ -1,6 +1,8 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  /* config options here */
+  allowedDevOrigins: [
+    "unscotched-overjoyfully-celia.ngrok-free.dev"
+  ],
 };
 
 export default nextConfig;
